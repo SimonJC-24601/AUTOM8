@@ -1,0 +1,30 @@
+{
+  "name": "autumn8/project",
+  "description": "AUTOMN8 project workspace",
+  "type": "project",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "AUTOMN8",
+      "email": "autumn8@example.com"
+    }
+  ],
+  "require": {
+    "php": "^8.0"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^9.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "App\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Tests\\": "tests/"
+    }
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true
+}
