@@ -1,0 +1,40 @@
+[
+    {
+      "integration": "APITemplate.io",
+      "category": "Creative Design Automation"
+    },
+    {
+      "integration": "AWS Transcribe",
+      "category": "AI Agent Development"
+    },
+    {
+      "integration": "AWSComprehend",
+      "category": "AI Agent Development"
+    },
+    {
+      "integration": "AWSLambda",
+      "category": "Technical Infrastructure & DevOps"
+    },
+    {
+      "integration": "AWSRekognition",
+      "category": "AI Agent Development"
+[
+  {
+    "filename": "0001_Telegram_Schedule_Automation_Scheduled.json",
+    "category": "Communication & Messaging"
+  },
+  {
+    "filename": "0002_Manual_Totp_Automation_Triggered.json",
+    "category": ""
+  },
+  {
+    "filename": "0003_Bitwarden_Automate.json",
+    "category": ""
+  },
+  {
+    "filename": "0004_GoogleSheets_Typeform_Automate_Triggered.json",
+    "category": "Data Processing & Analysis"
+  },
+  {
+    "filename": "0005_Manual_Twitter_Create_Triggered.json",
+    "category": "Social Media Management"

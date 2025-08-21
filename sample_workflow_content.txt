@@ -1,0 +1,50 @@
+{
+  "id": "02GdRzvsuHmSSgBw",
+  "meta": {
+    "instanceId": "31e69f7f4a77bf465b805824e303232f0227212ae922d12133a0f96ffeab4fef",
+    "templateCredsSetupCompleted": true
+  },
+  "name": "#️⃣Nostr #damus AI Powered Reporting + Gmail + Telegram",
+  "tags": [],
+  "nodes": [
+    {
+      "id": "e9c4c7bf-0cce-456e-9b95-726669e4b260",
+      "name": "When clicking ‘Test workflow’",
+      "type": "n8n-nodes-base.manualTrigger",
+      "position": [
+        -500,
+        -60
+      ],
+      "parameters": {},
+      "typeVersion": 1
+    },
+    {
+      "id": "b8f57e15-8a6e-4a29-a6e8-745bebbd1f44",
+      "name": "Get HTML",
+      "type": "n8n-nodes-base.markdown",
+      "position": [
+        880,
+        -840
+      ],
+      "parameters": {
+        "mode": "markdownToHtml",
+        "options": {},
+        "markdown": "={{ $json.text }}"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "8b212119-9b69-449c-8a3b-4fdc5b085f30",
+      "name": "Gmail Themes",
+      "type": "n8n-nodes-base.gmail",
+      "position": [
+        1080,
+        -840
+      ],
+      "webhookId": "e07f9378-bfa5-48ac-88fd-0ef88a725ede",
+      "parameters": {
+        "sendTo": "joe@example.com",
+        "message": "={{ $json.data }}",
+        "options": {
+          "appendAttribution": false
+        },

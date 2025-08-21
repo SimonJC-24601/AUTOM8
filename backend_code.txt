@@ -1,0 +1,1778 @@
+#!/usr/bin/env python3
+"""
+FastAPI Server for N8N Workflow Documentation
+High-performance API with sub-100ms response times.
+"""
+
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from pydantic import BaseModel, field_validator
+from typing import Optional, List, Dict, Any
+import json
+import os
+import asyncio
+from pathlib import Path
+import uvicorn
+
+from workflow_db import WorkflowDatabase
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="N8N Workflow Documentation API",
+    description="Fast API for browsing and searching workflow documentation",
+    version="2.0.0"
+)
+
+# Add middleware for performance
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize database
+db = WorkflowDatabase()
+
+# Startup function to verify database
+@app.on_event("startup")
+async def startup_event():
+    """Verify database connectivity on startup."""
+    try:
+        stats = db.get_stats()
+        if stats['total'] == 0:
+            print("⚠️  Warning: No workflows found in database. Run indexing first.")
+        else:
+            print(f"✅ Database connected: {stats['total']} workflows indexed")
+    except Exception as e:
+        print(f"❌ Database connection failed: {e}")
+        raise
+
+# Response models
+class WorkflowSummary(BaseModel):
+    id: Optional[int] = None
+    filename: str
+    name: str
+    active: bool
+    description: str = ""
+    trigger_type: str = "Manual"
+    complexity: str = "low"
+    node_count: int = 0
+    integrations: List[str] = []
+    tags: List[str] = []
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    
+    class Config:
+        # Allow conversion of int to bool for active field
+        validate_assignment = True
+        
+    @field_validator('active', mode='before')
+    @classmethod
+    def convert_active(cls, v):
+        if isinstance(v, int):
+            return bool(v)
+        return v
+    
+
+class SearchResponse(BaseModel):
+    workflows: List[WorkflowSummary]
+    total: int
+    page: int
+    per_page: int
+    pages: int
+    query: str
+    filters: Dict[str, Any]
+
+class StatsResponse(BaseModel):
+    total: int
+    active: int
+    inactive: int
+    triggers: Dict[str, int]
+    complexity: Dict[str, int]
+    total_nodes: int
+    unique_integrations: int
+    last_indexed: str
+
+@app.get("/")
+async def root():
+    """Serve the main documentation page."""
+    static_dir = Path("static")
+    index_file = static_dir / "index.html"
+    if not index_file.exists():
+        return HTMLResponse("""
+        <html><body>
+        <h1>Setup Required</h1>
+        <p>Static files not found. Please ensure the static directory exists with index.html</p>
+        <p>Current directory: """ + str(Path.cwd()) + """</p>
+        </body></html>
+        """)
+    return FileResponse(str(index_file))
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy", "message": "N8N Workflow API is running"}
+
+@app.get("/api/stats", response_model=StatsResponse)
+async def get_stats():
+    """Get workflow database statistics."""
+    try:
+        stats = db.get_stats()
+        return StatsResponse(**stats)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching stats: {str(e)}")
+
+@app.get("/api/workflows", response_model=SearchResponse)
+async def search_workflows(
+    q: str = Query("", description="Search query"),
+    trigger: str = Query("all", description="Filter by trigger type"),
+    complexity: str = Query("all", description="Filter by complexity"),
+    active_only: bool = Query(False, description="Show only active workflows"),
+    page: int = Query(1, ge=1, description="Page number"),
+    per_page: int = Query(20, ge=1, le=100, description="Items per page")
+):
+    """Search and filter workflows with pagination."""
+    try:
+        offset = (page - 1) * per_page
+        
+        workflows, total = db.search_workflows(
+            query=q,
+            trigger_filter=trigger,
+            complexity_filter=complexity,
+            active_only=active_only,
+            limit=per_page,
+            offset=offset
+        )
+        
+        # Convert to Pydantic models with error handling
+        workflow_summaries = []
+        for workflow in workflows:
+            try:
+                # Remove extra fields that aren't in the model
+                clean_workflow = {
+                    'id': workflow.get('id'),
+                    'filename': workflow.get('filename', ''),
+                    'name': workflow.get('name', ''),
+                    'active': workflow.get('active', False),
+                    'description': workflow.get('description', ''),
+                    'trigger_type': workflow.get('trigger_type', 'Manual'),
+                    'complexity': workflow.get('complexity', 'low'),
+                    'node_count': workflow.get('node_count', 0),
+                    'integrations': workflow.get('integrations', []),
+                    'tags': workflow.get('tags', []),
+                    'created_at': workflow.get('created_at'),
+                    'updated_at': workflow.get('updated_at')
+                }
+                workflow_summaries.append(WorkflowSummary(**clean_workflow))
+            except Exception as e:
+                print(f"Error converting workflow {workflow.get('filename', 'unknown')}: {e}")
+                # Continue with other workflows instead of failing completely
+                continue
+        
+        pages = (total + per_page - 1) // per_page  # Ceiling division
+        
+        return SearchResponse(
+            workflows=workflow_summaries,
+            total=total,
+            page=page,
+            per_page=per_page,
+            pages=pages,
+            query=q,
+            filters={
+                "trigger": trigger,
+                "complexity": complexity,
+                "active_only": active_only
+            }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error searching workflows: {str(e)}")
+
+@app.get("/api/workflows/{filename}")
+async def get_workflow_detail(filename: str):
+    """Get detailed workflow information including raw JSON."""
+    try:
+        # Get workflow metadata from database
+        workflows, _ = db.search_workflows(f'filename:"{filename}"', limit=1)
+        if not workflows:
+            raise HTTPException(status_code=404, detail="Workflow not found in database")
+        
+        workflow_meta = workflows[0]
+        
+        # Load raw JSON from file
+        file_path = os.path.join("workflows", filename)
+        if not os.path.exists(file_path):
+            print(f"Warning: File {file_path} not found on filesystem but exists in database")
+            raise HTTPException(status_code=404, detail=f"Workflow file '{filename}' not found on filesystem")
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            raw_json = json.load(f)
+        
+        return {
+            "metadata": workflow_meta,
+            "raw_json": raw_json
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error loading workflow: {str(e)}")
+
+@app.get("/api/workflows/{filename}/download")
+async def download_workflow(filename: str):
+    """Download workflow JSON file."""
+    try:
+        file_path = os.path.join("workflows", filename)
+        if not os.path.exists(file_path):
+            print(f"Warning: Download requested for missing file: {file_path}")
+            raise HTTPException(status_code=404, detail=f"Workflow file '{filename}' not found on filesystem")
+        
+        return FileResponse(
+            file_path,
+            media_type="application/json",
+            filename=filename
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Workflow file '{filename}' not found")
+    except Exception as e:
+        print(f"Error downloading workflow {filename}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error downloading workflow: {str(e)}")
+
+@app.get("/api/workflows/{filename}/diagram")
+async def get_workflow_diagram(filename: str):
+    """Get Mermaid diagram code for workflow visualization."""
+    try:
+        file_path = os.path.join("workflows", filename)
+        if not os.path.exists(file_path):
+            print(f"Warning: Diagram requested for missing file: {file_path}")
+            raise HTTPException(status_code=404, detail=f"Workflow file '{filename}' not found on filesystem")
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        nodes = data.get('nodes', [])
+        connections = data.get('connections', {})
+        
+        # Generate Mermaid diagram
+        diagram = generate_mermaid_diagram(nodes, connections)
+        
+        return {"diagram": diagram}
+    except HTTPException:
+        raise
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Workflow file '{filename}' not found")
+    except json.JSONDecodeError as e:
+        print(f"Error parsing JSON in {filename}: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON in workflow file: {str(e)}")
+    except Exception as e:
+        print(f"Error generating diagram for {filename}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating diagram: {str(e)}")
+
+def generate_mermaid_diagram(nodes: List[Dict], connections: Dict) -> str:
+    """Generate Mermaid.js flowchart code from workflow nodes and connections."""
+    if not nodes:
+        return "graph TD\n  EmptyWorkflow[No nodes found in workflow]"
+    
+    # Create mapping for node names to ensure valid mermaid IDs
+    mermaid_ids = {}
+    for i, node in enumerate(nodes):
+        node_id = f"node{i}"
+        node_name = node.get('name', f'Node {i}')
+        mermaid_ids[node_name] = node_id
+    
+    # Start building the mermaid diagram
+    mermaid_code = ["graph TD"]
+    
+    # Add nodes with styling
+    for node in nodes:
+        node_name = node.get('name', 'Unnamed')
+        node_id = mermaid_ids[node_name]
+        node_type = node.get('type', '').replace('n8n-nodes-base.', '')
+        
+        # Determine node style based on type
+        style = ""
+        if any(x in node_type.lower() for x in ['trigger', 'webhook', 'cron']):
+            style = "fill:#b3e0ff,stroke:#0066cc"  # Blue for triggers
+        elif any(x in node_type.lower() for x in ['if', 'switch']):
+            style = "fill:#ffffb3,stroke:#e6e600"  # Yellow for conditional nodes
+        elif any(x in node_type.lower() for x in ['function', 'code']):
+            style = "fill:#d9b3ff,stroke:#6600cc"  # Purple for code nodes
+        elif 'error' in node_type.lower():
+            style = "fill:#ffb3b3,stroke:#cc0000"  # Red for error handlers
+        else:
+            style = "fill:#d9d9d9,stroke:#666666"  # Gray for other nodes
+        
+        # Add node with label (escaping special characters)
+        clean_name = node_name.replace('"', "'")
+        clean_type = node_type.replace('"', "'")
+        label = f"{clean_name}<br>({clean_type})"
+        mermaid_code.append(f"  {node_id}[\"{label}\"]")
+        mermaid_code.append(f"  style {node_id} {style}")
+    
+    # Add connections between nodes
+    for source_name, source_connections in connections.items():
+        if source_name not in mermaid_ids:
+            continue
+        
+        if isinstance(source_connections, dict) and 'main' in source_connections:
+            main_connections = source_connections['main']
+            
+            for i, output_connections in enumerate(main_connections):
+                if not isinstance(output_connections, list):
+                    continue
+                    
+                for connection in output_connections:
+                    if not isinstance(connection, dict) or 'node' not in connection:
+                        continue
+                        
+                    target_name = connection['node']
+                    if target_name not in mermaid_ids:
+                        continue
+                        
+                    # Add arrow with output index if multiple outputs
+                    label = f" -->|{i}| " if len(main_connections) > 1 else " --> "
+                    mermaid_code.append(f"  {mermaid_ids[source_name]}{label}{mermaid_ids[target_name]}")
+    
+    # Format the final mermaid diagram code
+    return "\n".join(mermaid_code)
+
+@app.post("/api/reindex")
+async def reindex_workflows(background_tasks: BackgroundTasks, force: bool = False):
+    """Trigger workflow reindexing in the background."""
+    def run_indexing():
+        db.index_all_workflows(force_reindex=force)
+    
+    background_tasks.add_task(run_indexing)
+    return {"message": "Reindexing started in background"}
+
+@app.get("/api/integrations")
+async def get_integrations():
+    """Get list of all unique integrations."""
+    try:
+        stats = db.get_stats()
+        # For now, return basic info. Could be enhanced to return detailed integration stats
+        return {"integrations": [], "count": stats['unique_integrations']}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching integrations: {str(e)}")
+
+@app.get("/api/categories")
+async def get_categories():
+    """Get available workflow categories for filtering."""
+    try:
+        # Try to load from the generated unique categories file
+        categories_file = Path("context/unique_categories.json")
+        if categories_file.exists():
+            with open(categories_file, 'r', encoding='utf-8') as f:
+                categories = json.load(f)
+            return {"categories": categories}
+        else:
+            # Fallback: extract categories from search_categories.json
+            search_categories_file = Path("context/search_categories.json")
+            if search_categories_file.exists():
+                with open(search_categories_file, 'r', encoding='utf-8') as f:
+                    search_data = json.load(f)
+                
+                unique_categories = set()
+                for item in search_data:
+                    if item.get('category'):
+                        unique_categories.add(item['category'])
+                    else:
+                        unique_categories.add('Uncategorized')
+                
+                categories = sorted(list(unique_categories))
+                return {"categories": categories}
+            else:
+                # Last resort: return basic categories
+                return {"categories": ["Uncategorized"]}
+                
+    except Exception as e:
+        print(f"Error loading categories: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching categories: {str(e)}")
+
+@app.get("/api/category-mappings")
+async def get_category_mappings():
+    """Get filename to category mappings for client-side filtering."""
+    try:
+        search_categories_file = Path("context/search_categories.json")
+        if not search_categories_file.exists():
+            return {"mappings": {}}
+        
+        with open(search_categories_file, 'r', encoding='utf-8') as f:
+            search_data = json.load(f)
+        
+        # Convert to a simple filename -> category mapping
+        mappings = {}
+        for item in search_data:
+            filename = item.get('filename')
+            category = item.get('category') or 'Uncategorized'
+            if filename:
+                mappings[filename] = category
+        
+        return {"mappings": mappings}
+        
+    except Exception as e:
+        print(f"Error loading category mappings: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching category mappings: {str(e)}")
+
+@app.get("/api/workflows/category/{category}", response_model=SearchResponse)
+async def search_workflows_by_category(
+    category: str,
+    page: int = Query(1, ge=1, description="Page number"),
+    per_page: int = Query(20, ge=1, le=100, description="Items per page")
+):
+    """Search workflows by service category (messaging, database, ai_ml, etc.)."""
+    try:
+        offset = (page - 1) * per_page
+        
+        workflows, total = db.search_by_category(
+            category=category,
+            limit=per_page,
+            offset=offset
+        )
+        
+        # Convert to Pydantic models with error handling
+        workflow_summaries = []
+        for workflow in workflows:
+            try:
+                clean_workflow = {
+                    'id': workflow.get('id'),
+                    'filename': workflow.get('filename', ''),
+                    'name': workflow.get('name', ''),
+                    'active': workflow.get('active', False),
+                    'description': workflow.get('description', ''),
+                    'trigger_type': workflow.get('trigger_type', 'Manual'),
+                    'complexity': workflow.get('complexity', 'low'),
+                    'node_count': workflow.get('node_count', 0),
+                    'integrations': workflow.get('integrations', []),
+                    'tags': workflow.get('tags', []),
+                    'created_at': workflow.get('created_at'),
+                    'updated_at': workflow.get('updated_at')
+                }
+                workflow_summaries.append(WorkflowSummary(**clean_workflow))
+            except Exception as e:
+                print(f"Error converting workflow {workflow.get('filename', 'unknown')}: {e}")
+                continue
+        
+        pages = (total + per_page - 1) // per_page
+        
+        return SearchResponse(
+            workflows=workflow_summaries,
+            total=total,
+            page=page,
+            per_page=per_page,
+            pages=pages,
+            query=f"category:{category}",
+            filters={"category": category}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error searching by category: {str(e)}")
+
+# Custom exception handler for better error responses
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {str(exc)}"}
+    )
+
+# Mount static files AFTER all routes are defined
+static_dir = Path("static")
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+    print(f"✅ Static files mounted from {static_dir.absolute()}")
+else:
+    print(f"❌ Warning: Static directory not found at {static_dir.absolute()}")
+
+def create_static_directory():
+    """Create static directory if it doesn't exist."""
+    static_dir = Path("static")
+    static_dir.mkdir(exist_ok=True)
+    return static_dir
+
+def run_server(host: str = "127.0.0.1", port: int = 8000, reload: bool = False):
+    """Run the FastAPI server."""
+    # Ensure static directory exists
+    create_static_directory()
+    
+    # Debug: Check database connectivity
+    try:
+        stats = db.get_stats()
+        print(f"✅ Database connected: {stats['total']} workflows found")
+        if stats['total'] == 0:
+            print("🔄 Database is empty. Indexing workflows...")
+            db.index_all_workflows()
+            stats = db.get_stats()
+    except Exception as e:
+        print(f"❌ Database error: {e}")
+        print("🔄 Attempting to create and index database...")
+        try:
+            db.index_all_workflows()
+            stats = db.get_stats()
+            print(f"✅ Database created: {stats['total']} workflows indexed")
+        except Exception as e2:
+            print(f"❌ Failed to create database: {e2}")
+            stats = {'total': 0}
+    
+    # Debug: Check static files
+    static_path = Path("static")
+    if static_path.exists():
+        files = list(static_path.glob("*"))
+        print(f"✅ Static files found: {[f.name for f in files]}")
+    else:
+        print(f"❌ Static directory not found at: {static_path.absolute()}")
+    
+    print(f"🚀 Starting N8N Workflow Documentation API")
+    print(f"📊 Database contains {stats['total']} workflows")
+    print(f"🌐 Server will be available at: http://{host}:{port}")
+    print(f"📁 Static files at: http://{host}:{port}/static/")
+    
+    uvicorn.run(
+        "api_server:app",
+        host=host,
+        port=port,
+        reload=reload,
+        access_log=True,  # Enable access logs for debugging
+        log_level="info"
+    )
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='N8N Workflow Documentation API Server')
+    parser.add_argument('--host', default='127.0.0.1', help='Host to bind to')
+    parser.add_argument('--port', type=int, default=8000, help='Port to bind to')
+    parser.add_argument('--reload', action='store_true', help='Enable auto-reload for development')
+    
+    args = parser.parse_args()
+    
+    run_server(host=args.host, port=args.port, reload=args.reload)import json
+import os
+from pathlib import Path
+
+def load_def_categories():
+    """Load the definition categories from def_categories.json"""
+    def_categories_path = Path("context/def_categories.json")
+    with open(def_categories_path, 'r', encoding='utf-8') as f:
+        categories_data = json.load(f)
+    
+    # Create a mapping from integration name (lowercase) to category
+    integration_to_category = {}
+    for item in categories_data:
+        integration = item['integration'].lower()
+        category = item['category']
+        integration_to_category[integration] = category
+    
+    return integration_to_category
+
+def extract_tokens_from_filename(filename):
+    """Extract tokens from filename by splitting on '_' and removing '.json'"""
+    # Remove .json extension
+    name_without_ext = filename.replace('.json', '')
+    
+    # Split by underscore
+    tokens = name_without_ext.split('_')
+    
+    # Convert to lowercase for matching
+    tokens = [token.lower() for token in tokens if token]
+    
+    return tokens
+
+def find_matching_category(tokens, integration_to_category):
+    """Find the first matching category for the given tokens"""
+    for token in tokens:
+        if token in integration_to_category:
+            return integration_to_category[token]
+    
+    # Try partial matches for common variations
+    for token in tokens:
+        for integration in integration_to_category:
+            if token in integration or integration in token:
+                return integration_to_category[integration]
+    
+    return ""
+
+def main():
+    # Load definition categories
+    integration_to_category = load_def_categories()
+    
+    # Get all JSON files from workflows directory
+    workflows_dir = Path("workflows")
+    json_files = list(workflows_dir.glob("*.json"))
+    
+    # Process each file
+    search_categories = []
+    
+    for json_file in json_files:
+        filename = json_file.name
+        tokens = extract_tokens_from_filename(filename)
+        category = find_matching_category(tokens, integration_to_category)
+        
+        search_categories.append({
+            "filename": filename,
+            "category": category
+        })
+    
+    # Sort by filename for consistency
+    search_categories.sort(key=lambda x: x['filename'])
+    
+    # Write to search_categories.json
+    output_path = Path("context/search_categories.json")
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(search_categories, f, indent=2, ensure_ascii=False)
+    
+    print(f"Generated search_categories.json with {len(search_categories)} entries")
+    
+    # Generate unique categories list for API
+    unique_categories = set()
+    for item in search_categories:
+        if item['category']:
+            unique_categories.add(item['category'])
+    
+    # Always include 'Uncategorized' for workflows without categories
+    unique_categories.add('Uncategorized')
+    
+    # Sort categories alphabetically
+    categories_list = sorted(list(unique_categories))
+    
+    # Write unique categories to a separate file for API consumption
+    categories_output_path = Path("context/unique_categories.json")
+    with open(categories_output_path, 'w', encoding='utf-8') as f:
+        json.dump(categories_list, f, indent=2, ensure_ascii=False)
+    
+    print(f"Generated unique_categories.json with {len(categories_list)} categories")
+    
+    # Print some statistics
+    categorized = sum(1 for item in search_categories if item['category'])
+    uncategorized = len(search_categories) - categorized
+    print(f"Categorized: {categorized}, Uncategorized: {uncategorized}")
+    
+    # Print detailed category statistics
+    print("\n" + "="*50)
+    print("CATEGORY DISTRIBUTION (Top 20)")
+    print("="*50)
+    
+    # Count categories
+    category_counts = {}
+    for item in search_categories:
+        category = item['category'] if item['category'] else "Uncategorized"
+        category_counts[category] = category_counts.get(category, 0) + 1
+    
+    # Sort by count (descending)
+    sorted_categories = sorted(category_counts.items(), key=lambda x: x[1], reverse=True)
+    
+    # Display top 20
+    for i, (category, count) in enumerate(sorted_categories[:20], 1):
+        print(f"{i:2d}. {category:<40} {count:>4} files")
+    
+    if len(sorted_categories) > 20:
+        remaining = len(sorted_categories) - 20
+        print(f"\n... and {remaining} more categories")
+
+    # Write tips on uncategorized workflows
+    print("\n" + "="*50)
+    print("Tips on uncategorized workflows")
+    print("="*50)
+    print("1. At the search, you'll be able to list all uncategorized workflows.")
+    print("2. If the workflow JSON filename has a clear service name (eg. Twilio), it could just be we are missing its category definition at context/def_categories.json.")
+    print("3. You can contribute to the category definitions and then make a pull request to help improve the search experience.")
+
+
+    # Done message
+    print("\n" + "="*50)
+    print("Done! Search re-indexed with categories.")
+    print("="*50)
+
+if __name__ == "__main__":
+    main()
+#!/usr/bin/env python3
+"""
+N8N Workflow Importer
+Python replacement for import-workflows.sh with better error handling and progress tracking.
+"""
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import List, Dict, Any
+
+
+class WorkflowImporter:
+    """Import n8n workflows with progress tracking and error handling."""
+    
+    def __init__(self, workflows_dir: str = "workflows"):
+        self.workflows_dir = Path(workflows_dir)
+        self.imported_count = 0
+        self.failed_count = 0
+        self.errors = []
+
+    def validate_workflow(self, file_path: Path) -> bool:
+        """Validate workflow JSON before import."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # Basic validation
+            if not isinstance(data, dict):
+                return False
+            
+            # Check required fields
+            required_fields = ['nodes', 'connections']
+            for field in required_fields:
+                if field not in data:
+                    return False
+            
+            return True
+        except (json.JSONDecodeError, FileNotFoundError, PermissionError):
+            return False
+
+    def import_workflow(self, file_path: Path) -> bool:
+        """Import a single workflow file."""
+        try:
+            # Validate first
+            if not self.validate_workflow(file_path):
+                self.errors.append(f"Invalid JSON: {file_path.name}")
+                return False
+            
+            # Run n8n import command
+            result = subprocess.run([
+                'npx', 'n8n', 'import:workflow', 
+                f'--input={file_path}'
+            ], capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0:
+                print(f"✅ Imported: {file_path.name}")
+                return True
+            else:
+                error_msg = result.stderr.strip() or result.stdout.strip()
+                self.errors.append(f"Import failed for {file_path.name}: {error_msg}")
+                print(f"❌ Failed: {file_path.name}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            self.errors.append(f"Timeout importing {file_path.name}")
+            print(f"⏰ Timeout: {file_path.name}")
+            return False
+        except Exception as e:
+            self.errors.append(f"Error importing {file_path.name}: {str(e)}")
+            print(f"❌ Error: {file_path.name} - {str(e)}")
+            return False
+
+    def get_workflow_files(self) -> List[Path]:
+        """Get all workflow JSON files."""
+        if not self.workflows_dir.exists():
+            print(f"❌ Workflows directory not found: {self.workflows_dir}")
+            return []
+        
+        json_files = list(self.workflows_dir.glob("*.json"))
+        if not json_files:
+            print(f"❌ No JSON files found in: {self.workflows_dir}")
+            return []
+        
+        return sorted(json_files)
+
+    def import_all(self) -> Dict[str, Any]:
+        """Import all workflow files."""
+        workflow_files = self.get_workflow_files()
+        total_files = len(workflow_files)
+        
+        if total_files == 0:
+            return {"success": False, "message": "No workflow files found"}
+        
+        print(f"🚀 Starting import of {total_files} workflows...")
+        print("-" * 50)
+        
+        for i, file_path in enumerate(workflow_files, 1):
+            print(f"[{i}/{total_files}] Processing {file_path.name}...")
+            
+            if self.import_workflow(file_path):
+                self.imported_count += 1
+            else:
+                self.failed_count += 1
+        
+        # Summary
+        print("\n" + "=" * 50)
+        print(f"📊 Import Summary:")
+        print(f"✅ Successfully imported: {self.imported_count}")
+        print(f"❌ Failed imports: {self.failed_count}")
+        print(f"📁 Total files: {total_files}")
+        
+        if self.errors:
+            print(f"\n❌ Errors encountered:")
+            for error in self.errors[:10]:  # Show first 10 errors
+                print(f"   • {error}")
+            if len(self.errors) > 10:
+                print(f"   ... and {len(self.errors) - 10} more errors")
+        
+        return {
+            "success": self.failed_count == 0,
+            "imported": self.imported_count,
+            "failed": self.failed_count,
+            "total": total_files,
+            "errors": self.errors
+        }
+
+
+def check_n8n_available() -> bool:
+    """Check if n8n CLI is available."""
+    try:
+        result = subprocess.run(
+            ['npx', 'n8n', '--version'], 
+            capture_output=True, text=True, timeout=10
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def main():
+    """Main entry point."""
+    print("🔧 N8N Workflow Importer")
+    print("=" * 40)
+    
+    # Check if n8n is available
+    if not check_n8n_available():
+        print("❌ n8n CLI not found. Please install n8n first:")
+        print("   npm install -g n8n")
+        sys.exit(1)
+    
+    # Create importer and run
+    importer = WorkflowImporter()
+    result = importer.import_all()
+    
+    # Exit with appropriate code
+    sys.exit(0 if result["success"] else 1)
+
+
+if __name__ == "__main__":
+    main() #!/usr/bin/env python3
+"""
+🚀 N8N Workflows Search Engine Launcher
+Start the advanced search system with optimized performance.
+"""
+
+import sys
+import os
+import argparse
+from pathlib import Path
+
+
+def print_banner():
+    """Print application banner."""
+    print("🚀 n8n-workflows Advanced Search Engine")
+    print("=" * 50)
+
+
+def check_requirements() -> bool:
+    """Check if required dependencies are installed."""
+    missing_deps = []
+    
+    try:
+        import sqlite3
+    except ImportError:
+        missing_deps.append("sqlite3")
+    
+    try:
+        import uvicorn
+    except ImportError:
+        missing_deps.append("uvicorn")
+    
+    try:
+        import fastapi
+    except ImportError:
+        missing_deps.append("fastapi")
+    
+    if missing_deps:
+        print(f"❌ Missing dependencies: {', '.join(missing_deps)}")
+        print("💡 Install with: pip install -r requirements.txt")
+        return False
+    
+    print("✅ Dependencies verified")
+    return True
+
+
+def setup_directories():
+    """Create necessary directories."""
+    directories = ["database", "static", "workflows"]
+    
+    for directory in directories:
+        os.makedirs(directory, exist_ok=True)
+    
+    print("✅ Directories verified")
+
+
+def setup_database(force_reindex: bool = False) -> str:
+    """Setup and initialize the database."""
+    from workflow_db import WorkflowDatabase
+    
+    db_path = "database/workflows.db"
+    
+    print(f"🔄 Setting up database: {db_path}")
+    db = WorkflowDatabase(db_path)
+    
+    # Check if database has data or force reindex
+    stats = db.get_stats()
+    if stats['total'] == 0 or force_reindex:
+        print("📚 Indexing workflows...")
+        index_stats = db.index_all_workflows(force_reindex=True)
+        print(f"✅ Indexed {index_stats['processed']} workflows")
+        
+        # Show final stats
+        final_stats = db.get_stats()
+        print(f"📊 Database contains {final_stats['total']} workflows")
+    else:
+        print(f"✅ Database ready: {stats['total']} workflows")
+    
+    return db_path
+
+
+def start_server(host: str = "127.0.0.1", port: int = 8000, reload: bool = False):
+    """Start the FastAPI server."""
+    print(f"🌐 Starting server at http://{host}:{port}")
+    print(f"📊 API Documentation: http://{host}:{port}/docs")
+    print(f"🔍 Workflow Search: http://{host}:{port}/api/workflows")
+    print()
+    print("Press Ctrl+C to stop the server")
+    print("-" * 50)
+    
+    # Configure database path
+    os.environ['WORKFLOW_DB_PATH'] = "database/workflows.db"
+    
+    # Start uvicorn with better configuration
+    import uvicorn
+    uvicorn.run(
+        "api_server:app", 
+        host=host, 
+        port=port, 
+        reload=reload,
+        log_level="info",
+        access_log=False  # Reduce log noise
+    )
+
+
+def main():
+    """Main entry point with command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="N8N Workflows Search Engine",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python run.py                    # Start with default settings
+  python run.py --port 3000        # Start on port 3000
+  python run.py --host 0.0.0.0     # Accept external connections
+  python run.py --reindex          # Force database reindexing
+  python run.py --dev              # Development mode with auto-reload
+        """
+    )
+    
+    parser.add_argument(
+        "--host", 
+        default="127.0.0.1", 
+        help="Host to bind to (default: 127.0.0.1)"
+    )
+    parser.add_argument(
+        "--port", 
+        type=int, 
+        default=8000, 
+        help="Port to bind to (default: 8000)"
+    )
+    parser.add_argument(
+        "--reindex", 
+        action="store_true", 
+        help="Force database reindexing"
+    )
+    parser.add_argument(
+        "--dev", 
+        action="store_true", 
+        help="Development mode with auto-reload"
+    )
+    
+    args = parser.parse_args()
+    
+    print_banner()
+    
+    # Check dependencies
+    if not check_requirements():
+        sys.exit(1)
+    
+    # Setup directories
+    setup_directories()
+    
+    # Setup database
+    try:
+        setup_database(force_reindex=args.reindex)
+    except Exception as e:
+        print(f"❌ Database setup error: {e}")
+        sys.exit(1)
+    
+    # Start server
+    try:
+        start_server(
+            host=args.host, 
+            port=args.port, 
+            reload=args.dev
+        )
+    except KeyboardInterrupt:
+        print("\n👋 Server stopped!")
+    except Exception as e:
+        print(f"❌ Server error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main() #!/usr/bin/env python3
+"""
+Fast N8N Workflow Database
+SQLite-based workflow indexer and search engine for instant performance.
+"""
+
+import sqlite3
+import json
+import os
+import glob
+import datetime
+import hashlib
+from typing import Dict, List, Any, Optional, Tuple
+from pathlib import Path
+
+class WorkflowDatabase:
+    """High-performance SQLite database for workflow metadata and search."""
+    
+    def __init__(self, db_path: str = None):
+        # Use environment variable if no path provided
+        if db_path is None:
+            db_path = os.environ.get('WORKFLOW_DB_PATH', 'workflows.db')
+        self.db_path = db_path
+        self.workflows_dir = "workflows"
+        self.init_database()
+    
+    def init_database(self):
+        """Initialize SQLite database with optimized schema and indexes."""
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode=WAL")  # Write-ahead logging for performance
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=10000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        
+        # Create main workflows table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS workflows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                workflow_id TEXT,
+                active BOOLEAN DEFAULT 0,
+                description TEXT,
+                trigger_type TEXT,
+                complexity TEXT,
+                node_count INTEGER DEFAULT 0,
+                integrations TEXT,  -- JSON array
+                tags TEXT,         -- JSON array
+                created_at TEXT,
+                updated_at TEXT,
+                file_hash TEXT,
+                file_size INTEGER,
+                analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create FTS5 table for full-text search
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS workflows_fts USING fts5(
+                filename,
+                name,
+                description,
+                integrations,
+                tags,
+                content=workflows,
+                content_rowid=id
+            )
+        """)
+        
+        # Create indexes for fast filtering
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trigger_type ON workflows(trigger_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_complexity ON workflows(complexity)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_active ON workflows(active)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_node_count ON workflows(node_count)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_filename ON workflows(filename)")
+        
+        # Create triggers to keep FTS table in sync
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS workflows_ai AFTER INSERT ON workflows BEGIN
+                INSERT INTO workflows_fts(rowid, filename, name, description, integrations, tags)
+                VALUES (new.id, new.filename, new.name, new.description, new.integrations, new.tags);
+            END
+        """)
+        
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS workflows_ad AFTER DELETE ON workflows BEGIN
+                INSERT INTO workflows_fts(workflows_fts, rowid, filename, name, description, integrations, tags)
+                VALUES ('delete', old.id, old.filename, old.name, old.description, old.integrations, old.tags);
+            END
+        """)
+        
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS workflows_au AFTER UPDATE ON workflows BEGIN
+                INSERT INTO workflows_fts(workflows_fts, rowid, filename, name, description, integrations, tags)
+                VALUES ('delete', old.id, old.filename, old.name, old.description, old.integrations, old.tags);
+                INSERT INTO workflows_fts(rowid, filename, name, description, integrations, tags)
+                VALUES (new.id, new.filename, new.name, new.description, new.integrations, new.tags);
+            END
+        """)
+        
+        conn.commit()
+        conn.close()
+    
+    def get_file_hash(self, file_path: str) -> str:
+        """Get MD5 hash of file for change detection."""
+        hash_md5 = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    
+    def format_workflow_name(self, filename: str) -> str:
+        """Convert filename to readable workflow name."""
+        # Remove .json extension
+        name = filename.replace('.json', '')
+        
+        # Split by underscores
+        parts = name.split('_')
+        
+        # Skip the first part if it's just a number
+        if len(parts) > 1 and parts[0].isdigit():
+            parts = parts[1:]
+        
+        # Convert parts to title case and join with spaces
+        readable_parts = []
+        for part in parts:
+            # Special handling for common terms
+            if part.lower() == 'http':
+                readable_parts.append('HTTP')
+            elif part.lower() == 'api':
+                readable_parts.append('API')
+            elif part.lower() == 'webhook':
+                readable_parts.append('Webhook')
+            elif part.lower() == 'automation':
+                readable_parts.append('Automation')
+            elif part.lower() == 'automate':
+                readable_parts.append('Automate')
+            elif part.lower() == 'scheduled':
+                readable_parts.append('Scheduled')
+            elif part.lower() == 'triggered':
+                readable_parts.append('Triggered')
+            elif part.lower() == 'manual':
+                readable_parts.append('Manual')
+            else:
+                # Capitalize first letter
+                readable_parts.append(part.capitalize())
+        
+        return ' '.join(readable_parts)
+    
+    def analyze_workflow_file(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """Analyze a single workflow file and extract metadata."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            print(f"Error reading {file_path}: {str(e)}")
+            return None
+        
+        filename = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+        file_hash = self.get_file_hash(file_path)
+        
+        # Extract basic metadata
+        workflow = {
+            'filename': filename,
+            'name': self.format_workflow_name(filename),
+            'workflow_id': data.get('id', ''),
+            'active': data.get('active', False),
+            'nodes': data.get('nodes', []),
+            'connections': data.get('connections', {}),
+            'tags': data.get('tags', []),
+            'created_at': data.get('createdAt', ''),
+            'updated_at': data.get('updatedAt', ''),
+            'file_hash': file_hash,
+            'file_size': file_size
+        }
+        
+        # Use JSON name if available and meaningful, otherwise use formatted filename
+        json_name = data.get('name', '').strip()
+        if json_name and json_name != filename.replace('.json', '') and not json_name.startswith('My workflow'):
+            workflow['name'] = json_name
+        # If no meaningful JSON name, use formatted filename (already set above)
+        
+        # Analyze nodes
+        node_count = len(workflow['nodes'])
+        workflow['node_count'] = node_count
+        
+        # Determine complexity
+        if node_count <= 5:
+            complexity = 'low'
+        elif node_count <= 15:
+            complexity = 'medium'
+        else:
+            complexity = 'high'
+        workflow['complexity'] = complexity
+        
+        # Find trigger type and integrations
+        trigger_type, integrations = self.analyze_nodes(workflow['nodes'])
+        workflow['trigger_type'] = trigger_type
+        workflow['integrations'] = list(integrations)
+        
+        # Generate description
+        workflow['description'] = self.generate_description(workflow, trigger_type, integrations)
+        
+        return workflow
+    
+    def analyze_nodes(self, nodes: List[Dict]) -> Tuple[str, set]:
+        """Analyze nodes to determine trigger type and integrations."""
+        trigger_type = 'Manual'
+        integrations = set()
+        
+        # Enhanced service mapping for better recognition
+        service_mappings = {
+            # Messaging & Communication
+            'telegram': 'Telegram',
+            'telegramTrigger': 'Telegram',
+            'discord': 'Discord',
+            'slack': 'Slack', 
+            'whatsapp': 'WhatsApp',
+            'mattermost': 'Mattermost',
+            'teams': 'Microsoft Teams',
+            'rocketchat': 'Rocket.Chat',
+            
+            # Email
+            'gmail': 'Gmail',
+            'mailjet': 'Mailjet',
+            'emailreadimap': 'Email (IMAP)',
+            'emailsendsmt': 'Email (SMTP)',
+            'outlook': 'Outlook',
+            
+            # Cloud Storage
+            'googledrive': 'Google Drive',
+            'googledocs': 'Google Docs',
+            'googlesheets': 'Google Sheets',
+            'dropbox': 'Dropbox',
+            'onedrive': 'OneDrive',
+            'box': 'Box',
+            
+            # Databases
+            'postgres': 'PostgreSQL',
+            'mysql': 'MySQL',
+            'mongodb': 'MongoDB',
+            'redis': 'Redis',
+            'airtable': 'Airtable',
+            'notion': 'Notion',
+            
+            # Project Management
+            'jira': 'Jira',
+            'github': 'GitHub',
+            'gitlab': 'GitLab',
+            'trello': 'Trello',
+            'asana': 'Asana',
+            'mondaycom': 'Monday.com',
+            
+            # AI/ML Services
+            'openai': 'OpenAI',
+            'anthropic': 'Anthropic',
+            'huggingface': 'Hugging Face',
+            
+            # Social Media
+            'linkedin': 'LinkedIn',
+            'twitter': 'Twitter/X',
+            'facebook': 'Facebook',
+            'instagram': 'Instagram',
+            
+            # E-commerce
+            'shopify': 'Shopify',
+            'stripe': 'Stripe',
+            'paypal': 'PayPal',
+            
+            # Analytics
+            'googleanalytics': 'Google Analytics',
+            'mixpanel': 'Mixpanel',
+            
+            # Calendar & Tasks
+            'googlecalendar': 'Google Calendar', 
+            'googletasks': 'Google Tasks',
+            'cal': 'Cal.com',
+            'calendly': 'Calendly',
+            
+            # Forms & Surveys
+            'typeform': 'Typeform',
+            'googleforms': 'Google Forms',
+            'form': 'Form Trigger',
+            
+            # Development Tools
+            'webhook': 'Webhook',
+            'httpRequest': 'HTTP Request',
+            'graphql': 'GraphQL',
+            'sse': 'Server-Sent Events',
+            
+            # Utility nodes (exclude from integrations)
+            'set': None,
+            'function': None,
+            'code': None,
+            'if': None,
+            'switch': None,
+            'merge': None,
+            'split': None,
+            'stickynote': None,
+            'stickyNote': None,
+            'wait': None,
+            'schedule': None,
+            'cron': None,
+            'manual': None,
+            'stopanderror': None,
+            'noop': None,
+            'noOp': None,
+            'error': None,
+            'limit': None,
+            'aggregate': None,
+            'summarize': None,
+            'filter': None,
+            'sort': None,
+            'removeDuplicates': None,
+            'dateTime': None,
+            'extractFromFile': None,
+            'convertToFile': None,
+            'readBinaryFile': None,
+            'readBinaryFiles': None,
+            'executionData': None,
+            'executeWorkflow': None,
+            'executeCommand': None,
+            'respondToWebhook': None,
+        }
+        
+        for node in nodes:
+            node_type = node.get('type', '')
+            node_name = node.get('name', '').lower()
+            
+            # Determine trigger type
+            if 'webhook' in node_type.lower() or 'webhook' in node_name:
+                trigger_type = 'Webhook'
+            elif 'cron' in node_type.lower() or 'schedule' in node_type.lower():
+                trigger_type = 'Scheduled'
+            elif 'trigger' in node_type.lower() and trigger_type == 'Manual':
+                if 'manual' not in node_type.lower():
+                    trigger_type = 'Webhook'
+            
+            # Extract integrations with enhanced mapping
+            service_name = None
+            
+            # Handle n8n-nodes-base nodes
+            if node_type.startswith('n8n-nodes-base.'):
+                raw_service = node_type.replace('n8n-nodes-base.', '').lower()
+                raw_service = raw_service.replace('trigger', '')
+                service_name = service_mappings.get(raw_service, raw_service.title() if raw_service else None)
+            
+            # Handle @n8n/ namespaced nodes
+            elif node_type.startswith('@n8n/'):
+                raw_service = node_type.split('.')[-1].lower() if '.' in node_type else node_type.lower()
+                raw_service = raw_service.replace('trigger', '')
+                service_name = service_mappings.get(raw_service, raw_service.title() if raw_service else None)
+            
+            # Handle custom nodes
+            elif '-' in node_type:
+                # Try to extract service name from custom node names like "n8n-nodes-youtube-transcription-kasha.youtubeTranscripter"
+                parts = node_type.lower().split('.')
+                for part in parts:
+                    if 'youtube' in part:
+                        service_name = 'YouTube'
+                        break
+                    elif 'telegram' in part:
+                        service_name = 'Telegram'
+                        break
+                    elif 'discord' in part:
+                        service_name = 'Discord'
+                        break
+            
+            # Also check node names for service hints
+            for service_key, service_value in service_mappings.items():
+                if service_key in node_name and service_value:
+                    service_name = service_value
+                    break
+            
+            # Add to integrations if valid service found
+            if service_name and service_name not in ['None', None]:
+                integrations.add(service_name)
+        
+        # Determine if complex based on node variety and count
+        if len(nodes) > 10 and len(integrations) > 3:
+            trigger_type = 'Complex'
+        
+        return trigger_type, integrations
+    
+    def generate_description(self, workflow: Dict, trigger_type: str, integrations: set) -> str:
+        """Generate a descriptive summary of the workflow."""
+        name = workflow['name']
+        node_count = workflow['node_count']
+        
+        # Start with trigger description
+        trigger_descriptions = {
+            'Webhook': "Webhook-triggered automation that",
+            'Scheduled': "Scheduled automation that", 
+            'Complex': "Complex multi-step automation that",
+        }
+        desc = trigger_descriptions.get(trigger_type, "Manual workflow that")
+        
+        # Add functionality based on name and integrations
+        if integrations:
+            main_services = list(integrations)[:3]
+            if len(main_services) == 1:
+                desc += f" integrates with {main_services[0]}"
+            elif len(main_services) == 2:
+                desc += f" connects {main_services[0]} and {main_services[1]}"
+            else:
+                desc += f" orchestrates {', '.join(main_services[:-1])}, and {main_services[-1]}"
+        
+        # Add workflow purpose hints from name
+        name_lower = name.lower()
+        if 'create' in name_lower:
+            desc += " to create new records"
+        elif 'update' in name_lower:
+            desc += " to update existing data"
+        elif 'sync' in name_lower:
+            desc += " to synchronize data"
+        elif 'notification' in name_lower or 'alert' in name_lower:
+            desc += " for notifications and alerts"
+        elif 'backup' in name_lower:
+            desc += " for data backup operations"
+        elif 'monitor' in name_lower:
+            desc += " for monitoring and reporting"
+        else:
+            desc += " for data processing"
+        
+        desc += f". Uses {node_count} nodes"
+        if len(integrations) > 3:
+            desc += f" and integrates with {len(integrations)} services"
+        
+        return desc + "."
+    
+    def index_all_workflows(self, force_reindex: bool = False) -> Dict[str, int]:
+        """Index all workflow files. Only reprocesses changed files unless force_reindex=True."""
+        if not os.path.exists(self.workflows_dir):
+            print(f"Warning: Workflows directory '{self.workflows_dir}' not found.")
+            return {'processed': 0, 'skipped': 0, 'errors': 0}
+        
+        json_files = glob.glob(os.path.join(self.workflows_dir, "*.json"))
+        
+        if not json_files:
+            print(f"Warning: No JSON files found in '{self.workflows_dir}' directory.")
+            return {'processed': 0, 'skipped': 0, 'errors': 0}
+        
+        print(f"Indexing {len(json_files)} workflow files...")
+        
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        
+        stats = {'processed': 0, 'skipped': 0, 'errors': 0}
+        
+        for file_path in json_files:
+            filename = os.path.basename(file_path)
+            
+            try:
+                # Check if file needs to be reprocessed
+                if not force_reindex:
+                    current_hash = self.get_file_hash(file_path)
+                    cursor = conn.execute(
+                        "SELECT file_hash FROM workflows WHERE filename = ?", 
+                        (filename,)
+                    )
+                    row = cursor.fetchone()
+                    if row and row['file_hash'] == current_hash:
+                        stats['skipped'] += 1
+                        continue
+                
+                # Analyze workflow
+                workflow_data = self.analyze_workflow_file(file_path)
+                if not workflow_data:
+                    stats['errors'] += 1
+                    continue
+                
+                # Insert or update in database
+                conn.execute("""
+                    INSERT OR REPLACE INTO workflows (
+                        filename, name, workflow_id, active, description, trigger_type,
+                        complexity, node_count, integrations, tags, created_at, updated_at,
+                        file_hash, file_size, analyzed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, (
+                    workflow_data['filename'],
+                    workflow_data['name'],
+                    workflow_data['workflow_id'],
+                    workflow_data['active'],
+                    workflow_data['description'],
+                    workflow_data['trigger_type'],
+                    workflow_data['complexity'],
+                    workflow_data['node_count'],
+                    json.dumps(workflow_data['integrations']),
+                    json.dumps(workflow_data['tags']),
+                    workflow_data['created_at'],
+                    workflow_data['updated_at'],
+                    workflow_data['file_hash'],
+                    workflow_data['file_size']
+                ))
+                
+                stats['processed'] += 1
+                
+            except Exception as e:
+                print(f"Error processing {file_path}: {str(e)}")
+                stats['errors'] += 1
+                continue
+        
+        conn.commit()
+        conn.close()
+        
+        print(f"✅ Indexing complete: {stats['processed']} processed, {stats['skipped']} skipped, {stats['errors']} errors")
+        return stats
+    
+    def search_workflows(self, query: str = "", trigger_filter: str = "all", 
+                        complexity_filter: str = "all", active_only: bool = False,
+                        limit: int = 50, offset: int = 0) -> Tuple[List[Dict], int]:
+        """Fast search with filters and pagination."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        
+        # Build WHERE clause
+        where_conditions = []
+        params = []
+        
+        if active_only:
+            where_conditions.append("w.active = 1")
+        
+        if trigger_filter != "all":
+            where_conditions.append("w.trigger_type = ?")
+            params.append(trigger_filter)
+        
+        if complexity_filter != "all":
+            where_conditions.append("w.complexity = ?")
+            params.append(complexity_filter)
+        
+        # Use FTS search if query provided
+        if query.strip():
+            # FTS search with ranking
+            base_query = """
+                SELECT w.*, rank
+                FROM workflows_fts fts
+                JOIN workflows w ON w.id = fts.rowid
+                WHERE workflows_fts MATCH ?
+            """
+            params.insert(0, query)
+        else:
+            # Regular query without FTS
+            base_query = """
+                SELECT w.*, 0 as rank
+                FROM workflows w
+                WHERE 1=1
+            """
+        
+        if where_conditions:
+            base_query += " AND " + " AND ".join(where_conditions)
+        
+        # Count total results
+        count_query = f"SELECT COUNT(*) as total FROM ({base_query}) t"
+        cursor = conn.execute(count_query, params)
+        total = cursor.fetchone()['total']
+        
+        # Get paginated results
+        if query.strip():
+            base_query += " ORDER BY rank"
+        else:
+            base_query += " ORDER BY w.analyzed_at DESC"
+        
+        base_query += f" LIMIT {limit} OFFSET {offset}"
+        
+        cursor = conn.execute(base_query, params)
+        rows = cursor.fetchall()
+        
+        # Convert to dictionaries and parse JSON fields
+        results = []
+        for row in rows:
+            workflow = dict(row)
+            workflow['integrations'] = json.loads(workflow['integrations'] or '[]')
+            
+            # Parse tags and convert dict tags to strings
+            raw_tags = json.loads(workflow['tags'] or '[]')
+            clean_tags = []
+            for tag in raw_tags:
+                if isinstance(tag, dict):
+                    # Extract name from tag dict if available
+                    clean_tags.append(tag.get('name', str(tag.get('id', 'tag'))))
+                else:
+                    clean_tags.append(str(tag))
+            workflow['tags'] = clean_tags
+            
+            results.append(workflow)
+        
+        conn.close()
+        return results, total
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get database statistics."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        
+        # Basic counts
+        cursor = conn.execute("SELECT COUNT(*) as total FROM workflows")
+        total = cursor.fetchone()['total']
+        
+        cursor = conn.execute("SELECT COUNT(*) as active FROM workflows WHERE active = 1")
+        active = cursor.fetchone()['active']
+        
+        # Trigger type breakdown
+        cursor = conn.execute("""
+            SELECT trigger_type, COUNT(*) as count 
+            FROM workflows 
+            GROUP BY trigger_type
+        """)
+        triggers = {row['trigger_type']: row['count'] for row in cursor.fetchall()}
+        
+        # Complexity breakdown
+        cursor = conn.execute("""
+            SELECT complexity, COUNT(*) as count 
+            FROM workflows 
+            GROUP BY complexity
+        """)
+        complexity = {row['complexity']: row['count'] for row in cursor.fetchall()}
+        
+        # Node stats
+        cursor = conn.execute("SELECT SUM(node_count) as total_nodes FROM workflows")
+        total_nodes = cursor.fetchone()['total_nodes'] or 0
+        
+        # Unique integrations count
+        cursor = conn.execute("SELECT integrations FROM workflows WHERE integrations != '[]'")
+        all_integrations = set()
+        for row in cursor.fetchall():
+            integrations = json.loads(row['integrations'])
+            all_integrations.update(integrations)
+        
+        conn.close()
+        
+        return {
+            'total': total,
+            'active': active,
+            'inactive': total - active,
+            'triggers': triggers,
+            'complexity': complexity,
+            'total_nodes': total_nodes,
+            'unique_integrations': len(all_integrations),
+            'last_indexed': datetime.datetime.now().isoformat()
+        }
+
+    def get_service_categories(self) -> Dict[str, List[str]]:
+        """Get service categories for enhanced filtering."""
+        return {
+            'messaging': ['Telegram', 'Discord', 'Slack', 'WhatsApp', 'Mattermost', 'Microsoft Teams', 'Rocket.Chat'],
+            'email': ['Gmail', 'Mailjet', 'Email (IMAP)', 'Email (SMTP)', 'Outlook'],
+            'cloud_storage': ['Google Drive', 'Google Docs', 'Google Sheets', 'Dropbox', 'OneDrive', 'Box'],
+            'database': ['PostgreSQL', 'MySQL', 'MongoDB', 'Redis', 'Airtable', 'Notion'],
+            'project_management': ['Jira', 'GitHub', 'GitLab', 'Trello', 'Asana', 'Monday.com'],
+            'ai_ml': ['OpenAI', 'Anthropic', 'Hugging Face'],
+            'social_media': ['LinkedIn', 'Twitter/X', 'Facebook', 'Instagram'],
+            'ecommerce': ['Shopify', 'Stripe', 'PayPal'],
+            'analytics': ['Google Analytics', 'Mixpanel'],
+            'calendar_tasks': ['Google Calendar', 'Google Tasks', 'Cal.com', 'Calendly'],
+            'forms': ['Typeform', 'Google Forms', 'Form Trigger'],
+            'development': ['Webhook', 'HTTP Request', 'GraphQL', 'Server-Sent Events', 'YouTube']
+        }
+
+    def search_by_category(self, category: str, limit: int = 50, offset: int = 0) -> Tuple[List[Dict], int]:
+        """Search workflows by service category."""
+        categories = self.get_service_categories()
+        if category not in categories:
+            return [], 0
+        
+        services = categories[category]
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        
+        # Build OR conditions for all services in category
+        service_conditions = []
+        params = []
+        for service in services:
+            service_conditions.append("integrations LIKE ?")
+            params.append(f'%"{service}"%')
+        
+        where_clause = " OR ".join(service_conditions)
+        
+        # Count total results
+        count_query = f"SELECT COUNT(*) as total FROM workflows WHERE {where_clause}"
+        cursor = conn.execute(count_query, params)
+        total = cursor.fetchone()['total']
+        
+        # Get paginated results
+        query = f"""
+            SELECT * FROM workflows 
+            WHERE {where_clause}
+            ORDER BY analyzed_at DESC
+            LIMIT {limit} OFFSET {offset}
+        """
+        
+        cursor = conn.execute(query, params)
+        rows = cursor.fetchall()
+        
+        # Convert to dictionaries and parse JSON fields
+        results = []
+        for row in rows:
+            workflow = dict(row)
+            workflow['integrations'] = json.loads(workflow['integrations'] or '[]')
+            raw_tags = json.loads(workflow['tags'] or '[]')
+            clean_tags = []
+            for tag in raw_tags:
+                if isinstance(tag, dict):
+                    clean_tags.append(tag.get('name', str(tag.get('id', 'tag'))))
+                else:
+                    clean_tags.append(str(tag))
+            workflow['tags'] = clean_tags
+            results.append(workflow)
+        
+        conn.close()
+        return results, total
+
+
+def main():
+    """Command-line interface for workflow database."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='N8N Workflow Database')
+    parser.add_argument('--index', action='store_true', help='Index all workflows')
+    parser.add_argument('--force', action='store_true', help='Force reindex all files')
+    parser.add_argument('--search', help='Search workflows')
+    parser.add_argument('--stats', action='store_true', help='Show database statistics')
+    
+    args = parser.parse_args()
+    
+    db = WorkflowDatabase()
+    
+    if args.index:
+        stats = db.index_all_workflows(force_reindex=args.force)
+        print(f"Indexed {stats['processed']} workflows")
+    
+    elif args.search:
+        results, total = db.search_workflows(args.search, limit=10)
+        print(f"Found {total} workflows:")
+        for workflow in results:
+            print(f"  - {workflow['name']} ({workflow['trigger_type']}, {workflow['node_count']} nodes)")
+    
+    elif args.stats:
+        stats = db.get_stats()
+        print(f"Database Statistics:")
+        print(f"  Total workflows: {stats['total']}")
+        print(f"  Active: {stats['active']}")
+        print(f"  Total nodes: {stats['total_nodes']}")
+        print(f"  Unique integrations: {stats['unique_integrations']}")
+        print(f"  Trigger types: {stats['triggers']}")
+    
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

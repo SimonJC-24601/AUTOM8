@@ -1,0 +1,54 @@
+generator client {
+    provider = "prisma-client-js"
+    binaryTargets = ["native", "linux-musl-arm64-openssl-3.0.x"]
+    output = "/home/ubuntu/n8n-workflows-website/app/node_modules/.prisma/client"
+}
+
+datasource db {
+    provider = "postgresql"
+    url      = env("DATABASE_URL")
+}
+
+model Workflow {
+  id           Int      @id @default(autoincrement())
+  filename     String   @unique
+  name         String
+  workflowId   String?  @map("workflow_id")
+  active       Boolean  @default(false)
+  description  String?
+  triggerType  String?  @map("trigger_type") // Manual, Webhook, Scheduled, Triggered
+  complexity   String?  // low, medium, high
+  nodeCount    Int      @default(0) @map("node_count")
+  integrations Json?    // JSON array of services
+  tags         Json?    // JSON array of tags
+  createdAt    String?  @map("created_at")
+  updatedAt    String?  @map("updated_at")
+  fileHash     String?  @map("file_hash") // MD5 for change detection
+  fileSize     Int?     @map("file_size")
+  analyzedAt   DateTime @default(now()) @map("analyzed_at")
+  rawJson      Json?    @map("raw_json") // Store the complete n8n workflow JSON
+
+  @@map("workflows")
+  @@index([triggerType])
+  @@index([complexity])
+  @@index([active])
+  @@index([nodeCount])
+  @@index([filename])
+}
+
+model Category {
+  id           Int    @id @default(autoincrement())
+  name         String @unique
+  description  String?
+  
+  @@map("categories")
+}
+
+model Integration {
+  id           Int    @id @default(autoincrement())
+  name         String @unique
+  category     String
+  description  String?
+  
+  @@map("integrations")
+}
